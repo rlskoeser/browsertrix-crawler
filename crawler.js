@@ -24,6 +24,7 @@ const warcio = require("warcio");
 const behaviors = fs.readFileSync("/app/node_modules/browsertrix-behaviors/dist/behaviors.js", "utf-8");
 
 const  TextExtract  = require("./util/textextract");
+const { S3StorageSync } = require("./util/storage");
 const { ScreenCaster } = require("./util/screencaster");
 const { parseArgs } = require("./util/argParser");
 
