@@ -13,6 +13,7 @@ const HTTP_AGENT = require("http").Agent();
 const fetch = require("node-fetch");
 const puppeteer = require("puppeteer-core");
 const { Cluster } = require("puppeteer-cluster");
+const { RedisCrawlState, MemoryCrawlState } = require("./util/state");
 const AbortController = require("abort-controller");
 const Sitemapper = require("sitemapper");
 const { v4: uuidv4 } = require("uuid");
@@ -20,7 +21,7 @@ const Redis = require("ioredis");
 
 const warcio = require("warcio");
 
-const behaviors = fs.readFileSync("/app/node_modules/browsertrix-behaviors/dist/behaviors.js", "utf-8");
+const behaviors = fs.readFileSync(path.join(__dirname, "node_modules", "browsertrix-behaviors", "dist", "behaviors.js"), {encoding: "utf8"});
 
 const  TextExtract  = require("./util/textextract");
 const { ScreenCaster } = require("./util/screencaster");
@@ -37,7 +38,7 @@ const { BlockRules } = require("./util/blockrules");
 class Crawler {
   constructor() {
     this.headers = {};
-    this.seenList = new Set();
+    this.crawlState = null;
 
     this.emulateDevice = null;
 
@@ -117,7 +118,8 @@ class Crawler {
       let version = process.env.BROWSER_VERSION;
 
       try {
-        version = child_process.execFileSync(this.browserExe, ["--product-version"], {encoding: "utf8"}).trim();
+        version = child_process.execFileSync(this.browserExe, ["--version"], {encoding: "utf8"});
+        version = version.match(/[\d.]+/)[0];
       } catch(e) {
         console.error(e);
       }
@@ -164,7 +166,12 @@ class Crawler {
       }
     });
 
-    if (!this.params.headless) {
+
+    this.redis = new Redis("redis://localhost/0");
+
+    this.crawlState = new RedisCrawlState(this.redis, "btrix2");
+
+    if (!this.params.headless && !process.env.NO_XVFB) {
       child_process.spawn("Xvfb", [
         process.env.DISPLAY,
         "-listen",
@@ -198,6 +205,7 @@ class Crawler {
     return {
       headless: this.params.headless,
       executablePath: this.browserExe,
+      handleSIGINT: false,
       ignoreHTTPSErrors: true,
       args: this.chromeArgs,
       userDataDir: this.profileDir,
@@ -324,6 +332,12 @@ class Crawler {
       monitor: this.params.logging.includes("stats")
     });
 
+    this.cluster.jobQueue = this.crawlState;
+
+    if (this.params.state) {
+      this.cluster.allTargetCount = await this.crawlState.load(this.params.state);
+    }
+
     this.cluster.task((opts) => this.crawlPage(opts));
 
     await this.initPages();
@@ -339,7 +353,7 @@ class Crawler {
 
     for (let i = 0; i < this.params.scopedSeeds.length; i++) {
       const seed = this.params.scopedSeeds[i];
-      this.queueUrl(i, seed.url, 0);
+      await this.queueUrl(i, seed.url, 0);
 
       if (seed.sitemap) {
         await this.parseSitemap(seed.sitemap, i);
@@ -348,6 +362,10 @@ class Crawler {
 
     await this.cluster.idle();
     await this.cluster.close();
+
+    if (this.crawlState.drain) {
+      console.log(await this.crawlState.serialize());
+    }
 
     this.writeStats();
 
@@ -393,7 +411,7 @@ class Crawler {
     if (this.params.statsFilename) {
       const total = this.cluster.allTargetCount;
       const workersRunning = this.cluster.workersBusy.length;
-      const numCrawled = total - this.cluster.jobQueue.size() - workersRunning;
+      const numCrawled = total - (await this.cluster.jobQueue.size()) - workersRunning;
       const limit = {max: this.params.limit || 0, hit: this.limitHit};
       const stats = {numCrawled, workersRunning, total, limit};
 
@@ -436,7 +454,7 @@ class Crawler {
 
     for (const opts of selectorOptsList) {
       const links = await this.extractLinks(page, opts);
-      this.queueInScopeUrls(seedId, links, depth);
+      await this.queueInScopeUrls(seedId, links, depth);
     }
   }
 
@@ -471,7 +489,7 @@ class Crawler {
     return results;
   }
 
-  queueInScopeUrls(seedId, urls, depth) {
+  async queueInScopeUrls(seedId, urls, depth) {
     try {
       depth += 1;
       const seed = this.params.scopedSeeds[seedId];
@@ -480,7 +498,7 @@ class Crawler {
         const captureUrl = seed.isIncluded(url, depth);
 
         if (captureUrl) {
-          this.queueUrl(seedId, captureUrl, depth);
+          await this.queueUrl(seedId, captureUrl, depth);
         }
       }
     } catch (e) {
@@ -488,12 +506,12 @@ class Crawler {
     }
   }
 
-  queueUrl(seedId, url, depth) {
-    if (this.seenList.has(url)) {
+  async queueUrl(seedId, url, depth) {
+    if (await this.crawlState.has(url)) {
       return false;
     }
 
-    this.seenList.add(url);
+    await this.crawlState.add(url);
     if (this.numLinks >= this.params.limit && this.params.limit > 0) {
       this.limitHit = true;
       return false;
@@ -624,7 +642,7 @@ class Crawler {
 
     try {
       const { sites } = await sitemapper.fetch();
-      this.queueInScopeUrls(seedId, sites, 0);
+      await this.queueInScopeUrls(seedId, sites, 0);
     } catch(e) {
       console.warn(e);
     }

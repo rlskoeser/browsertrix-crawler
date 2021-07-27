@@ -1,17 +1,33 @@
 #!/usr/bin/env node
 
-process.once("SIGINT", () => {
+var crawler = null;
+
+process.on("SIGINT", async () => {
   console.log("SIGINT received, exiting");
-  process.exit(1);
+  if (crawler) {
+    try {
+      if (!crawler.crawlState.drain) {
+        crawler.cluster.allTargetCount -= (await crawler.crawlState.size());// - crawler.cluster.workersBusy.length;
+        crawler.crawlState.drain = true;
+      } else {
+        console.log(crawler.crawlState.serialize());
+        process.exit(1);
+      }
+    } catch (e) {
+      console.log(e);
+    }
+  }
 });
 
-process.once("SIGTERM", () => {
+process.on("SIGTERM", () => {
   console.log("SIGTERM received, exiting");
-  process.exit(1);
 });
+
 
 
 const { Crawler } = require("./crawler");
 
-new Crawler().run();
+crawler = new Crawler();
+crawler.run();
+
 
