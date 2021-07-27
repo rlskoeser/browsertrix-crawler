@@ -2,17 +2,21 @@
 
 var crawler = null;
 
+var lastSigInt = 0;
+
 process.on("SIGINT", async () => {
-  console.log("SIGINT received, exiting");
   if (crawler) {
     try {
       if (!crawler.crawlState.drain) {
-        crawler.cluster.allTargetCount -= (await crawler.crawlState.size());// - crawler.cluster.workersBusy.length;
+        console.log("SIGINT received, gracefully finishing current pages...");
+        crawler.cluster.allTargetCount -= (await crawler.crawlState.size());
         crawler.crawlState.drain = true;
-      } else {
-        console.log(crawler.crawlState.serialize());
+      } else if ((Date.now() - lastSigInt) > 200) {
+        console.log("SIGINT received, aborting crawl...");
+        console.log(await crawler.crawlState.serialize());
         process.exit(1);
       }
+      lastSigInt = Date.now();
     } catch (e) {
       console.log(e);
     }
