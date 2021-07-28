@@ -140,11 +140,17 @@ class Crawler {
     }
   }
 
-  initCrawlState() {
+  async initCrawlState() {
     const stateStore = this.params.stateStore;
 
     if (stateStore && stateStore.startsWith("redis://")) {
-      const redis = new Redis(stateStore);
+      const redis = new Redis(stateStore, {lazyConnect: true});
+
+      try {
+        await redis.connect();
+      } catch (e) {
+        throw new Error("Unable to connect to state store Redis: " + stateStore);
+      }
 
       this.statusLog("Storing state via Redis: " + stateStore);
 
@@ -180,8 +186,6 @@ class Crawler {
     opts.env = {...process.env, COLL: this.params.collection, ROLLOVER_SIZE: this.params.rolloverSize};
 
     subprocesses.push(child_process.spawn("uwsgi", [path.join(__dirname, "uwsgi.ini")], opts));
-
-    this.initCrawlState();
 
     process.on("exit", () => {
       for (const proc of subprocesses) {
@@ -233,6 +237,8 @@ class Crawler {
 
   async run() {
     this.bootstrap();
+
+    await this.initCrawlState();
 
     try {
       await this.crawl();
@@ -381,9 +387,7 @@ class Crawler {
     await this.cluster.idle();
     await this.cluster.close();
 
-    if (this.crawlState.draining) {
-      await this.serializeConfig();
-    }
+    await this.serializeConfig();
 
     this.writeStats();
 
