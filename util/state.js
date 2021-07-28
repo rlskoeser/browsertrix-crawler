@@ -1,38 +1,57 @@
 const Job = require("puppeteer-cluster/dist/Job").default;
 
 
-class MemoryCrawlState
+// ============================================================================
+class BaseState
 {
   constructor() {
+    this.draining = false;
+  }
+
+  setDrain() {
+    this.draining = true;
+  }
+}
+
+
+// ============================================================================
+class MemoryCrawlState extends BaseState
+{
+  constructor() {
+    super();
     this.seenList = new Set();
     this.queue = [];
     this.pending = {};
+    this.done = [];
   }
 
   push(job) {
-    this.queue.push(job);
+    this.queue.unshift(job.data);
   }
 
   size() {
-    return this.queue.length;
+    return this.draining ? 0 : this.queue.length;
   }
 
   shift() {
-    const job = this.queue.shift();
-    const str = JSON.stringify(job.data);
+    const data = this.queue.pop();
+    data.started = new Date().toISOString();
+    const str = JSON.stringify(data);
     this.pending[str] = 1;
 
-    job.executeCallbacks = {
+    const callback = {
       resolve: () => {
         delete this.pending[str];
+        data.finished = new Date().toISOString();
+        this.done.unshift(data);
       },
 
       reject: () => {
-        console.warn("URL Load Failed: " + job.data.url);
+        console.warn("URL Load Failed: " + data.url);
       }
     };
 
-    return job;
+    return new Job(data, undefined, callback);
   }
 
   has(url) {
@@ -42,12 +61,45 @@ class MemoryCrawlState
   add(url) {
     return this.seenList.add(url);
   }
+
+  async serialize() {
+    const queued = this.queue.map(x => JSON.stringify(x));
+    const pending = Object.keys(this.pending);
+    const done = this.done.map(x => JSON.stringify(x));
+
+    return {queued, pending, done};
+  }
+
+  async load(state) {
+    for (const json of state.queued) {
+      const data = JSON.parse(json);
+      this.queue.push(data);
+      this.seenList.add(data.url);
+    }
+
+    for (const json of state.pending) {
+      const data = JSON.parse(json);
+      this.queue.push(data);
+      this.seenList.add(data.url);
+    }
+
+    for (const json of state.done) {
+      const data = JSON.parse(json);
+      this.done.push(data);
+      this.seenList.add(data.url);
+    }
+
+    return this.seenList.size;
+  }
+
 }
 
 
-class RedisCrawlState
+// ============================================================================
+class RedisCrawlState extends BaseState
 {
   constructor(redis, key) {
+    super();
     this.redis = redis;
 
     this.key = key;
@@ -63,7 +115,10 @@ class RedisCrawlState
   }
 
   async size() {
-    if (this.drain) return 0;
+    // return 0 if draining to avoid pulling any more data
+    if (this.draining) {
+      return 0;
+    }
 
     return await this.redis.llen(this.qkey);
   }
@@ -108,9 +163,7 @@ class RedisCrawlState
     const pending = await this.redis.smembers(this.pkey);
     const done = await this.redis.lrange(this.dkey, 0, -1);
 
-    const state = {queued, pending, done};
-
-    return state;
+    return {queued, pending, done};
   }
 
   async load(state) {
@@ -137,5 +190,6 @@ class RedisCrawlState
   }
 }
 
+//module.exports.RedisCrawlState = MemoryCrawlState;
 module.exports.RedisCrawlState = RedisCrawlState;
 module.exports.MemoryCrawlState = MemoryCrawlState;

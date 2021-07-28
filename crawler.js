@@ -18,6 +18,7 @@ const AbortController = require("abort-controller");
 const Sitemapper = require("sitemapper");
 const { v4: uuidv4 } = require("uuid");
 const Redis = require("ioredis");
+const yaml = require("js-yaml");
 
 const warcio = require("warcio");
 
@@ -53,7 +54,9 @@ class Crawler {
 
     this.userAgent = "";
 
-    this.params = parseArgs();
+    const res = parseArgs();
+    this.params = res.parsed;
+    this.origConfig = res.origConfig;
 
     this.debugLogging = this.params.logging.includes("debug");
 
@@ -137,6 +140,24 @@ class Crawler {
     }
   }
 
+  initCrawlState() {
+    const stateStore = this.params.stateStore;
+
+    if (stateStore && stateStore.startsWith("redis://")) {
+      const redis = new Redis(stateStore);
+
+      this.statusLog("Storing state via Redis: " + stateStore);
+
+      const crawlId = this.params.collection + "-" + uuidv4();
+
+      this.crawlState = new RedisCrawlState(redis, crawlId);
+    } else {
+      this.statusLog("Storing state in memory");
+
+      this.crawlState = new MemoryCrawlState();
+    }
+  }
+
   bootstrap() {
     let opts = {};
     if (this.params.logging.includes("pywb")) {
@@ -160,16 +181,13 @@ class Crawler {
 
     subprocesses.push(child_process.spawn("uwsgi", [path.join(__dirname, "uwsgi.ini")], opts));
 
+    this.initCrawlState();
+
     process.on("exit", () => {
       for (const proc of subprocesses) {
         proc.kill();
       }
     });
-
-
-    this.redis = new Redis("redis://localhost/0");
-
-    this.crawlState = new RedisCrawlState(this.redis, "btrix2");
 
     if (!this.params.headless && !process.env.NO_XVFB) {
       child_process.spawn("Xvfb", [
@@ -363,8 +381,8 @@ class Crawler {
     await this.cluster.idle();
     await this.cluster.close();
 
-    if (this.crawlState.drain) {
-      console.log(await this.crawlState.serialize());
+    if (this.crawlState.draining) {
+      await this.serializeConfig();
     }
 
     this.writeStats();
@@ -741,6 +759,22 @@ class Crawler {
     }
 
     this.debugLog(`Combined WARCs saved as: ${generatedCombinedWarcs}`);
+  }
+
+  async serializeConfig() {
+    if (!this.params.saveState) {
+      return;
+    }
+
+    this.statusLog("Saving crawl state to: " + this.params.saveState);
+
+    const state = await this.crawlState.serialize();
+
+    if (this.origConfig) {
+      this.origConfig.state = state;
+    }
+    const res = yaml.dump(this.origConfig, {lineWidth: -1});
+    fs.writeFileSync(this.params.saveState, res);
   }
 }
 
